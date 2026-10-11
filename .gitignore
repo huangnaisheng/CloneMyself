@@ -1,0 +1,145 @@
+# ============================================================
+#  CloneMyself — .gitignore
+#  Publish rule: METHOD AND CODE ONLY.  No corpus, no chat text,
+#  no personal identifiers, no model weights.
+#  When in doubt, this file ignores it.
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. Model weights & caches (tens of GB)
+# ------------------------------------------------------------
+models/
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+hf_cache/
+.ollama/
+
+# LoRA / merged adapters produced by runs
+*-lora/
+*.lora/
+merged-*/
+smoke-*/
+
+# ------------------------------------------------------------
+# 2. Python environments
+# ------------------------------------------------------------
+.style-ft-venv/
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ------------------------------------------------------------
+# 3. Vendored third-party tools (not our code)
+# ------------------------------------------------------------
+llamacpp/llama.cpp-master/
+llamacpp/*.tar.gz
+llamacpp/*.zip
+qce/
+OllamaSetup.exe
+*.exe
+*.dll
+*.msi
+
+# ------------------------------------------------------------
+# 4. THIRD-PARTY PRIVATE DATA — never publish
+#    Raw QQ DB backups, probing artefacts, and the installer
+#    that carries someone's chat history.
+# ------------------------------------------------------------
+qq_backup/
+qq_probe/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+candidates.bin
+
+# ------------------------------------------------------------
+# 5. Chat corpus and everything derived from real messages
+#    (any .jsonl in this tree is derived from private chats)
+# ------------------------------------------------------------
+*.jsonl
+clean_monologue.jsonl
+few_shot_examples.jsonl
+few_shot_prompt.md
+reply_pairs.jsonl
+my_messages.jsonl
+sft_context_*.jsonl
+
+# Exports of the chat client
+exports/
+*_chunked_jsonl/
+chunked_jsonl/
+
+# ------------------------------------------------------------
+# 6. Handover / planning notes that name real people and groups
+# ------------------------------------------------------------
+HANDOFF.md
+群友语料获取方案.md
+
+# ------------------------------------------------------------
+# 6b. The original working tree.
+#     It interleaves useful code with private data and hardcodes
+#     the target's uin / nickname / group card, so it is excluded
+#     wholesale.  The published pipeline lives in src/ instead.
+# ------------------------------------------------------------
+style_kit/
+qq_backup/
+qq_probe/
+
+# ------------------------------------------------------------
+# 7. Run artefacts
+# ------------------------------------------------------------
+*.log
+train*.log
+checkpoint-*/
+runs/
+wandb/
+eval_*_results.json
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# ------------------------------------------------------------
+# 8. Secrets & OS cruft
+# ------------------------------------------------------------
+.env
+*.env
+security.json
+.qce-config/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ------------------------------------------------------------
+# 9. Local machine state (not part of the project)
+#    .dsh-acl-recovery holds this machine's file-permission
+#    backups from sandbox repair; llamacpp/bin is vendored.
+# ------------------------------------------------------------
+.dsh-acl-recovery/
+llamacpp/bin/
+
+# ------------------------------------------------------------
+# 10. Keep these even though patterns above would catch them
+# ------------------------------------------------------------
+!requirements.txt
+!**/requirements.txt
+!.gitignore
+!README.md
+!README.zh-CN.md
+!README.en.md
+!LICENSE
+!**/*.example.jsonl
+!docs/**/*.md
+!src/**/*.py

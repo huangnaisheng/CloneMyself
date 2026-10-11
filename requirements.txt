@@ -1,0 +1,17 @@
+# Tested together on Windows 11 + CUDA 12.4 + RTX 4080 Laptop (12 GB).
+# The bitsandbytes + paged_adamw_8bit combination is what makes an 8B QLoRA
+# fit in 12 GB without Windows paging VRAM out to system RAM.
+torch==2.6.0+cu124
+transformers==4.51.3
+peft==0.15.2
+trl==0.15.2
+accelerate==1.5.2
+bitsandbytes==0.45.3
+datasets==3.5.0
+numpy==2.2.6
+sentencepiece==0.2.2
+safetensors
+psutil
+
+# torch is installed from the CUDA index, not PyPI:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
