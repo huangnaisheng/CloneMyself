@@ -138,7 +138,6 @@ llamacpp/bin/
 !.gitignore
 !README.md
 !README.zh-CN.md
-!README.en.md
 !LICENSE
 !**/*.example.jsonl
 !docs/**/*.md
