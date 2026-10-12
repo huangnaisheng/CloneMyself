@@ -1,235 +1,167 @@
-# Fine-tuning a "sounds like this person" model on 12 GB of VRAM
+# Fine-tuning "this person" on 12 GB VRAM
 
-**A full write-up of the method, the numbers, and every trap I fell into. No chat corpus in this repository.**
+**Complete experiment record: method, data, code, and every trap encountered. No corpus or weights included.**
 
 English · [中文](README.zh-CN.md)
 
 ---
 
-## In one line
+## Overview
 
-Using **one person's own messages** from a Chinese group chat (~20k messages),
-fine-tune Qwen3-8B with QLoRA on a **12 GB laptop GPU** so it talks like that person.
+Fine-tuned Qwen3-8B with QLoRA on a 12 GB VRAM laptop using single-user message records (~20k messages) from a Chinese group chat to replicate a specific conversational style.
 
-This repository contains **the method and the code only**. The corpus, the trained
-weights, and any real conversation text are deliberately not published — see
-[Why no corpus](#why-no-corpus).
+This repository contains **method, code, and complete analysis**. Raw corpus, trained weights, and real conversation examples are not published (see [Privacy](#why-no-corpus)).
 
 ---
 
 ## Contents
 
-- [1. The problem, and the hard limit of the data](#1-the-problem-and-the-hard-limit-of-the-data)
-- [2. Hardware reality: 12 GB of VRAM](#2-hardware-reality-12-gb-of-vram)
-- [3. Five traps that are actually worth your time](#3-five-traps-that-are-actually-worth-your-time)
-- [4. The pipeline](#4-the-pipeline)
-- [5. Results](#5-results)
-- [6. The validation-set trap](#6-the-validation-set-trap)
-- [7. Repository layout](#7-repository-layout)
-- [8. Reproducing this](#8-reproducing-this)
-- [9. Why no corpus](#9-why-no-corpus)
+- [Data limitations](#data-limitations)
+- [Hardware constraints](#hardware-constraints)
+- [Key problems](#key-problems)
+- [Processing pipeline](#processing-pipeline)
+- [Experimental results](#experimental-results)
+- [Validation set problem](#validation-set-problem)
+- [Project structure](#project-structure)
+- [Reproduction](#reproduction)
+- [Privacy](#privacy)
 
 ---
 
-## 1. The problem, and the hard limit of the data
+## Data limitations
 
-The exporter (QQ Chat Exporter, running on NapCat) handed me a file containing
-**only the target person's own messages**.
+Files exported by QQ Chat Exporter (via NapCat) **contain only the target user's messages**.
 
-Don't start training yet — first measure what you actually got. Message `seq`
-numbers in a group are **strictly increasing**, so coverage is just:
-
-```
-coverage = records_kept / (max_seq - min_seq + 1)
-```
+First step: quantify actual coverage. Group message `seq` numbers are strictly increasing, so coverage = exported count / (max_seq - min_seq + 1)
 
 | Metric | Value |
 |---|---|
-| Records | ~20,700 |
-| `seq` range | 105,390 – 228,856 |
-| `seq` span | 123,467 |
-| **Coverage** | **16.70%** |
-| **Missing slots** | **~102,900** |
+| Exported messages | ~20,700 |
+| seq range | 105,390 – 228,856 |
+| seq span | 123,467 |
+| Coverage | 16.70% |
+| Missing slots | ~102,900 |
 
-**16.7% coverage means the ~102,900 missing slots are where everyone else talked.
-They never made it into the export at all.**
+**16.7% coverage means ~100k missing slots are messages from other group members.**
 
-Here's why: the exporter calls `getMsgsBySeqAndCount` / `getAioFirstViewLatestMsgs`,
-which are **AIO (conversation-view) scoped** APIs. They return the *local view of the
-conversation from your own perspective*, and are **structurally incapable** of
-returning other members' messages. Its own log says `filtered out: 0` — the tool
-dropped nothing. That's simply all there was.
+Cause: The export tool calls `getMsgsBySeqAndCount` and `getAioFirstViewLatestMsgs` APIs, which are AIO (conversation view) scoped and structurally limited to returning the personal perspective, excluding other members' messages. Tool logs show `filtered out: 0`, indicating nothing was dropped—this is simply all that was available.
 
-> **Takeaway**: to find out whether your export is "self-only", don't guess — measure
-> `seq` coverage. Near 100% means the whole group conversation; 15–20% means a
-> single-person view.
+**Key point**: To determine if an export is single-user view, measure seq coverage directly. Near 100% indicates full group conversation; 10-20% indicates single-user view.
 
-### What this means for training
+### Training impact
 
-The most valuable supervision signal is "**someone said X → I replied Y**". With no
-other members' messages in the export, that signal can only be mined from
-**reply quotes** — the reply element stores the quoted original message and its sender.
+The most valuable supervision signal is "person says X → I reply Y". Without other members' messages in the export, this signal can only be extracted from **reply quotes**—reply elements contain the quoted original message and sender.
 
-So there were only ~**1,244** usable pairs, **1,092** after cleaning.
-**That is the ceiling on quality.**
+Result: Only ~1,244 usable pairs, 1,092 after cleaning. **This is the quality ceiling**.
 
-The other signal path is "**my line → my next line**" (my own consecutive messages).
-It's far more plentiful, but it teaches *"how to continue my own thought"* —
-**not** *"how to answer someone"*. The difference between these two is the root
-cause of every problem that follows.
+The other signal source is "my message A → my message B" (consecutive self-messages), which is abundant but trains "how to continue my own thoughts" rather than "how to respond to others". This difference is the root cause of all subsequent problems.
 
 ---
 
-## 2. Hardware reality: 12 GB of VRAM
+## Hardware constraints
 
-RTX 4080 Laptop, 12,282 MiB VRAM, 31.7 GB system RAM.
+RTX 4080 Laptop: 12,282 MiB VRAM, 31.7 GB system RAM.
 
-An 8B model **is** trainable with QLoRA (4-bit NF4 + double quantisation), but with
-zero headroom:
+8B model trainable with QLoRA (4-bit NF4 + double quantization) but with zero headroom:
 
-| Item | Usage |
+| Item | VRAM usage |
 |---|---|
 | 4-bit model weights | ~10,020 MB |
 | Free | ~2,262 MB |
 
-`embed_tokens` and `lm_head` stay in fp16 (~2.5 GB). Parameter mix works out to
-roughly `3472.9M uint8 + 1245.0M float16`.
+`embed_tokens` and `lm_head` remain fp16 (~2.5 GB), parameter composition approximately 3.47 GiB uint8 + 1.25 GiB float16.
 
-### The key symptom: training "hangs" — it's not a hang, it's VRAM paging
+### VRAM paging problem
 
-This is the single most valuable trap, because **every conventional metric looks fine**:
+Training exhibited significant performance degradation while conventional monitoring metrics appeared normal:
 
 ```
-GPU utilisation : 100%        <- looks like it's working hard
-Power draw      : 54-67 W     <- THIS is the tell
-Seconds/step    : 20-66 s
+GPU utilization: 100%
+Power draw: 54-67 W
+Time per step: 20-66 s
 ```
 
-**100% utilisation at only 55–65 W** means the GPU is **waiting on memory**.
-The real cause: 12 GB of VRAM was 97% full, and **Windows WDDM was paging VRAM out
-to system RAM**, leaving the compute units idle.
+**High utilization with low power draw is the key signal**. 100% utilization with only 55-65 W indicates the GPU is waiting on memory access. Actual cause: VRAM at 97% capacity, Windows WDDM paging VRAM to system memory, GPU compute units idling.
 
-> **Diagnostic rule**: `high utilisation + power far below TDP` = VRAM paging,
-> not insufficient compute. Healthy training here draws 110–126 W.
-> Watching only the utilisation figure will fool you — **always read power draw too**.
+**Diagnostic rule**: High utilization + power far below TDP = VRAM paging. Normal training should consume 110-126 W. Monitoring only nvidia-smi utilization is misleading—power draw must be checked simultaneously.
 
-### The fix
+### Solution
 
 ```python
-per_device_train_batch_size = 1        # not wasted VRAM: insurance against paging
-gradient_accumulation_steps = 8        # effective batch is still 8
-optim = "paged_adamw_8bit"             # page optimizer state to RAM, not VRAM
+per_device_train_batch_size = 1        # Prevent VRAM paging
+gradient_accumulation_steps = 8        # Maintain effective batch size
+optim = "paged_adamw_8bit"             # Page optimizer state to system RAM
 PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 ```
 
-After this, power returned to 110–126 W and it held a steady **10–20 s/step**.
+After adjustment, power stabilized at 110-126 W with 10-20 s per step.
 
-### A throughput lesson on the side
+### Throughput tradeoff
 
-For the same work, `batch=1 × accum=8` ran 11 s/step while `batch=2 × accum=4` ran
-**5.2 s/step** — 2.1× faster. But the latter left only ~**155 MB** of VRAM free, and
-step time then degraded from 5.6 s to 8.4 s — **it was already sliding into paging**.
+For the same task, `batch=1 × accum=8` took 11 s/step while `batch=2 × accum=4` took 5.2 s/step (2.1× speedup). However, the latter left only ~155 MB free VRAM, with step time gradually degrading from 5.6 s to 8.4 s—already entering paging territory.
 
-> A VRAM-saturated configuration **looks like it works**, then quietly degrades
-> mid-run. Leaving headroom matters more than maximising peak throughput.
+**Conclusion**: VRAM-saturated configurations appear viable but gradually degrade mid-run. Preserving headroom matters more than maximizing peak throughput.
 
 ---
 
-## 3. Five traps that are actually worth your time
+## Key problems
 
-This is the most valuable section of this document. The first four are not
-"you misconfigured something" problems.
+### Problem 1: Export placeholders in training data
 
-### Trap 1: `原消息` — an export placeholder treated as training material
+When the tool cannot parse a reply quote's original message, the `content` field becomes **the literal string `原消息`**.
 
-When the exporter cannot resolve a quoted original message, the reply element's
-`content` field is the **literal string `原消息`** (Chinese for "original message").
+Result: ~128 reply samples (10% of reply signal) used this literal as the "stimulus". Model learned "how to respond to the words '原消息'"—pure noise occupying the most valuable signal budget.
 
-Result: **~128 reply examples (10% of the reply signal) had that literal string as
-their "stimulus".**
+Similar noise: `[图片]`, `[视频:...]`, bare `@mention`, self-replies (quoted sender is self).
 
-The model dutifully learned "how to reply to the words *original message*" — pure
-noise, occupying the most valuable signal budget.
+**Solution**: During dataset construction, apply **explicit blacklist validation** to stimulus fields, not just non-empty checks. Placeholders resemble text but carry no meaning.
 
-Similar noise: `[图片]` (*image*), `[视频:...]` (*video*), bare `@mentions`,
-and **"replying to myself"** (where the quoted sender is the target).
+### Problem 2: Task confusion
 
-> **Lesson**: when building a dataset, apply an **explicit blocklist** to the
-> stimulus field — don't just check for non-empty. Placeholders look like ordinary
-> text but carry no meaning.
-
-### Trap 2: Sharing one prompt between "reply" and "continue" breaks task separation
-
-The original construction used **one system prompt and one user-turn shape** for
-both tasks:
+Original design used one system prompt and identical user structure for both "reply" and "continue" tasks:
 
 ```
-system: You are mimicking group member X's way of speaking...
-user:   X: <my previous line>\nGroupmate: <what they said>
+system: You are mimicking group member X's speaking style...
+user:   X: <my previous line>\nMember: <what they said>
 ```
 
-So the model learned the rule: "**the recent text is all things I said**."
+Model learned the pattern: "recent text is all my own words".
 
-The consequence showed up unmistakably at inference. Asked "钟馗?" (*Zhong Kui?*),
-the model answered:
+Problem surfaced during inference: Asked "钟馗?", model replied "What big sword and small sword were you asking about earlier?"—fabricating non-existent context. Because training "context" was almost always self-messages, model learned to "pretend it just said something" rather than "respond to current input".
 
-> **"What big sword and small sword were you asking about earlier?"**
+**Solution**: Different tasks require different system prompts and structures. Cannot expect model to infer task type from content—must distinguish structurally.
 
-**It fabricated a prior conversation that never existed.** Because in training the
-"context" was almost always its own words, it learned to *pretend it had just said
-something* rather than *answer the line in front of it*.
+### Problem 3: TRL auto-discards labels
 
-> **Lesson**: if two tasks are **different behaviours at inference time**, they must be
-> **structurally distinguishable at training time**. Don't hope the model infers the
-> task type from content — give it two different system prompts, and make
-> "whose words go in which role" strictly correct.
+When manually constructing `labels`, prompt portions are marked -100 to restrict loss to generation only.
 
-### Trap 3: TRL silently discards hand-built labels
-
-To make the loss apply only to the sentence the model should generate, the standard
-approach is to build `labels` by hand and mark the prompt with `-100`.
-
-**But `SFTTrainer`'s `truncate` step throws your `labels` away entirely** — so you
-believe you're "learning only the reply" while actually training on the whole
-conversation.
+`SFTTrainer`'s `truncate` step **completely discards custom labels**, resulting in training on entire conversations rather than just learning replies.
 
 ```python
-dataset_kwargs={'skip_prepare_dataset': True}   # mandatory
+dataset_kwargs={'skip_prepare_dataset': True}   # Required
 ```
 
-> **Lesson**: after building labels by hand, **write a verification script** proving
-> "the prompt is an exact prefix of the full sequence" and "some tokens really are
-> supervised". See [`src/check_masking.py`](src/check_masking.py), which validates
-> every single example. This class of bug never raises — it just makes results
-> inexplicably bad.
+**Solution**: Write verification script proving prompt is exact prefix of full sequence and tokens are actually supervised (see `src/check_masking.py`). This class of bug raises no exceptions, only mysteriously poor results.
 
-### Trap 4: which region does the `<think>` block belong to?
+### Problem 4: thinking block boundaries
 
-Qwen3's chat template inserts a `<think></think>` block into assistant turns.
-When building labels by hand it is easy to put it on the wrong side of the boundary.
+Qwen3 chat template inserts `<think></think>` blocks in assistant turns. Manual label construction can easily misalign boundaries.
 
-**This one turned out to be a false alarm, but the method is worth recording.**
-I looked up the `<think>` token id, searched for it inside the *supervised* span, and
-got 0/11,606 hits — briefly concluding the template had changed.
+Investigation method: Queried `<think>` token id, searched in supervised span, 0/11606 hits. Briefly suspected template structure changed.
 
-In fact it wasn't missing: it was **correctly sitting inside the prompt region, masked
-out**. The prompt rendered with `add_generation_prompt=True` already ends with
-`<|im_start|>assistant\n<think>\n\n</think>\n\n`, and the quoted message sits
-**after** it.
+Actually it correctly sat in the prompt region being masked: `add_generation_prompt=True` renders prompts ending with `<|im_start|>assistant\n<think>\n\n</think>\n\n`, with quoted message following.
 
-> **Lesson**: verification scripts should **print the actual text on both sides of the
-> boundary** (with `repr()`), not just report found/not-found. A bare boolean will make
-> you misjudge your own code.
+**Solution**: Verification scripts should print actual text on both sides of boundary (using `repr()`), not just report found/not-found booleans.
 
-### Trap 5: Chinese paths corrupt command-line tool arguments
+### Problem 5: Chinese paths break command-line arguments
 
-Passing a Chinese directory name to `llama-quantize.exe` mangles the argument:
+Chinese directory names passed to `llama-quantize.exe` get encoding-mangled:
 
 ```
 中文目录  →  Ĭ�Ϲ�����
 ```
 
-**Fix**: create a pure-ASCII directory junction and use forward slashes everywhere:
+**Solution**: Create pure-ASCII directory junction, use forward slashes uniformly in scripts:
 
 ```cmd
 mklink /J C:\gguf D:\path\to\workspace
@@ -239,219 +171,181 @@ mklink /J C:\gguf D:\path\to\workspace
 WS=/c/gguf
 ```
 
-> **Lesson**: this path depends on the junction existing. Delete the junction and every
-> script fails silently. Assert the junction exists; don't assume it.
+**Note**: Solution depends on junction existing. Deleting junction causes all scripts to silently fail. Scripts should assert junction exists.
 
-### Aside: all three Ollama 0.40.2 deployment paths are dead
+### Ollama 0.40.2 deployment routes blocked
 
-Worth listing, because it forces the whole export route:
-
-| Attempt | Error |
+| Attempt | Result |
 |---|---|
-| `ADAPTER` to load a LoRA directly | `LoRA adapters are no longer supported` |
-| Import a safetensors directory | `MLX runtime is not available` (MLX is Apple-only) |
+| `ADAPTER` load LoRA | `LoRA adapters are no longer supported` |
+| Import safetensors | `MLX runtime is not available` (MLX macOS-only) |
 | `--quantize int4` | `quantize blob lm_head.weight: MLX init failed` |
 
-**Conclusion: convert to GGUF via llama.cpp yourself.** See
-[`src/export_gguf.sh`](src/export_gguf.sh).
+**Conclusion**: Must convert to GGUF via llama.cpp manually (see `src/export_gguf.sh`).
 
 ---
 
-## 4. The pipeline
+## Processing pipeline
 
 ```
-QQ export JSONL
-  └─ clean corpus (drop system msgs / media placeholders / bot commands)  src/clean_corpus.py
-       └─ build two SFT sets (reply / continue, structurally separated)   src/build_sft_dataset.py
-            └─ validate the masking contract (prefix + supervised)        src/check_masking.py
-                 └─ QLoRA fine-tune (early stop + task-matched val set)   src/train_qlora.py
-                      └─ merge LoRA into the base, shard by shard         src/merge_lora.py
-                           └─ HF → GGUF (f16)                             src/export_gguf.sh
-                                └─ llama-quantize → Q4_K_M
-                                     └─ ollama create
+QQ export → JSONL cleaning → Build SFT dataset → Verify masking
+                                                      ↓
+                                                QLoRA tuning
+                                                      ↓
+                                                 LoRA merge
+                                                      ↓
+                                            HF → GGUF → Q4_K_M
 ```
 
-### Two key decisions in dataset construction
+### Key dataset construction decisions
 
-**Decision 1: three tasks, three different prompts.**
+**Decision 1: Task isolation**
 
 | Task | system prompt | user turn | assistant turn |
 |---|---|---|---|
-| `reply` | "A groupmate just said something to you… **answer only that line; do not refer to anything you said before**" | the groupmate's quoted text (their words only) | my reply |
-| `continue` | "Continue what you were just saying" | a real multi-turn slice, **with my lines in assistant turns** | my next line |
+| reply | Only respond to this line, don't mention your prior words | Member's original text (their words only) | Reply |
+| continue | Continue your own words | Real multi-turn slice, self-messages in assistant turns | Next line |
 
-**The critical part**: the `reply` user turn contains **none of my own history**.
-That is what kills the fabricated-prior-context failure mode at the root.
+Key: reply user turns **exclude self-history**, preventing context fabrication at the root.
 
-**Decision 2: build continuation samples from real multi-turn slices**, not by
-concatenating messages into one blob.
+**Decision 2: Use real multi-turn structure for continuation**
 
-Putting "my lines" in the `assistant` role and "their lines" in the `user` role teaches
-the model "it's my turn to speak", rather than "all this recent text is mine".
+Placing self-messages in `assistant` role and others' in `user` role teaches model "my turn to speak" rather than "these recent characters are all mine".
 
-### Merging LoRA: why shard by shard
+### LoRA merge: Shard-by-shard processing
 
-Loading the whole 8B model in bfloat16 needs ~16 GB of RAM, which this machine
-(31.7 GB, also running other things) cannot spare. [`src/merge_lora.py`](src/merge_lora.py)
-processes **one safetensors shard at a time**:
+Loading full 8B model in bfloat16 requires ~16 GB RAM, which this machine cannot spare (31.7 GB total running other tasks). `src/merge_lora.py` uses **shard-by-shard processing**:
 
 ```python
 delta = (B @ A) * (lora_alpha / r)      # 32 / 16 = 2.0
 sd[key].add_(delta.to(sd[key].dtype))
 ```
 
-Peak memory is about "one shard (~4 GB) + one LoRA delta" instead of the whole model.
+Peak memory equals single shard (~4 GB) + LoRA delta, not full model.
 
-> ⚠️ **Never hard-code `lora_alpha / r`.**
-> Read it from `adapter_config.json`. This run happened to be `r=16, alpha=32`
-> (scale 2.0), but a hard-coded constant will **silently compute the wrong merge** for
-> any other config — and the model still runs, it just sounds wrong.
+**Note**: Do not hard-code `lora_alpha / r`. Must read from `adapter_config.json`. This experiment happened to be `r=16, alpha=32` (scale 2.0), but hard-coded constants will silently compute wrong merges for other configs.
 
 ---
 
-## 5. Results
+## Experimental results
 
 ### Training configuration
 
 | Item | Value |
 |---|---|
 | Base | Qwen3-8B |
-| Method | QLoRA: 4-bit NF4 + double quantisation |
-| LoRA | `r=16`, `alpha=32`, `dropout=0.05`, targets `q/k/v/o/gate/up/down_proj` |
-| Trainable params | 43,646,976 (**0.5301%** of the model) |
+| Method | QLoRA: 4-bit NF4 + double quantization |
+| LoRA params | r=16, alpha=32, dropout=0.05, targets q/k/v/o/gate/up/down_proj |
+| Trainable params | 43,646,976 (0.5301% of model) |
 | Sequence length | 768 |
-| Optimizer | `paged_adamw_8bit` |
-| Batch | `batch=1 × accum=8` |
-| LR | `2e-4`, cosine, 3% warmup |
+| Optimizer | paged_adamw_8bit |
+| Batch | batch=1 × accum=8 |
+| Learning rate | 2e-4, cosine decay, 3% warmup |
 
-### Two versions compared
+### Version comparison
 
 | Metric | v1 (400 steps) | v2 (600 cumulative) |
 |---|---|---|
-| Train loss | 3.51 | **2.05** |
+| Train loss | 3.51 | 2.05 |
 | Train token accuracy | 45.4% | 64.6% |
-| Val loss | **3.91** | **4.32** ⚠️ |
+| Val loss | 3.91 | 4.32 ⚠️ |
 | Val token accuracy | 40.0% | 39.5% |
 
-Look at the gap:
+Gap analysis:
 
 ```
-              train loss    val loss     gap
-v1 (400 steps)   3.51   →    3.91      +0.40   <- healthy
-v2 (+200 steps)  2.05   →    4.32      +2.27   <- memorising
+              Train loss → Val loss    Gap
+v1 (400 steps)   3.51   →   3.91      +0.40 (healthy)
+v2 (+200 steps)  2.05   →   4.32      +2.27 (overfitting)
 ```
 
-200 more steps pushed train token accuracy from 45% to 65%, while the validation set
-**did not move at all** (40.0% → 39.5%).
+200 additional steps increased training accuracy from 45% to 65%, while validation remained unchanged (40.0% → 39.5%). v2 warm-started from v1 (initial train loss ~3.06), collapsing after 200 steps and 0.25 epochs. Overfitting arrives far faster than expected.
 
-> **v2's `loss 2.05` is a flattering number that lies.**
-
-More notable: v2 was **warm-started from v1**, so its starting train loss was already
-~3.06 (≈ v1's converged value). It took only 200 steps and 0.25 of an epoch to break.
-**Overfitting arrives much faster than you expect.**
-
-### Base vs fine-tuned
+### Base vs fine-tuned comparison
 
 | Prompt | Base Qwen3-8B | v1 | v2 |
 |---|---|---|---|
-| "I'll spank you" | Hahaha where? These are golden! | deer head | bring on a fight |
-| "You're so bad at this" | I'd give that play full marks | so much idle chatter | oh I embarrassed myself |
-| "Lend me money" | A hundred million? Interest first… | either way, just afraid you can't repay | sure |
-| "Hiking tomorrow?" | Tomorrow? My legs are jelly.jpg — fine, let's go | go | works for me |
+| Spank you | Hahaha where? These are golden! | deer head | bring it on |
+| You're so bad | I'd give that play full marks | so much chatter | oh I embarrassed myself |
+| Lend money | A hundred million? Interest first... | either way, just afraid you can't repay | sure |
+| Hiking tomorrow? | Tomorrow? My legs are jelly.jpg—fine, let's go | go | works for me |
 
-The base model is a **verbose, over-explaining assistant with exclamation marks**;
-after fine-tuning it produces **two-to-four character fragments**, matching the
-corpus's **median length of 8 characters**.
+Base model exhibits **verbose, explanatory, exclamation-heavy** assistant style; after fine-tuning produces **short fragments** matching corpus **median length of 8 characters**.
 
-> **This is what the fine-tune is actually doing**: not "teaching it knowledge" but
-> **transplanting the output-length distribution and the tone.**
+**Essence**: Fine-tuning doesn't "teach knowledge" but **transfers output length distribution and tone**.
 
-### But loss does not measure "does it sound like them"
+### Loss vs similarity disconnect
 
-**This needs stating plainly**: loss measures "how accurately the next token is
-predicted", **not** "does this sound like the person".
+Loss only measures "next token prediction accuracy", **not "sounds like this person"**.
 
-In real conversation v2 actually reads *more* like them ("spank you" → v2 replies
-"bring on a fight", v1 replies "deer head"). **The final criterion should be whether a
-human reads it as convincing, not the loss.** Both versions were kept for A/B testing.
+In actual conversation v2 reads more authentic ("spank you" → v2 replies "bring it on", v1 replies "deer head"). Final criterion should be human assessment, not loss values. Both versions retained for A/B comparison.
 
 ---
 
-## 6. The validation-set trap
+## Validation set problem
 
-**On review, this was the most serious methodological error — more fundamental than
-the overfitting itself.**
+**This is the most serious methodological error, more fundamental than overfitting itself.**
 
-The v1/v2 validation set composition:
+v1/v2 validation set composition:
 
 | Component | Count | Share |
 |---|---|---|
 | Reply samples | 100 | 17% |
-| Continuation samples | 400 | **83%** |
+| Continue samples | 400 | 83% |
 
-And the continuation user turns were **randomly stitched together from the same pool of
-messages** — not a conversation prefix that ever actually existed.
+Continue samples' user turns were **randomly stitched from the same message pool**—not real conversation prefixes.
 
-**So 83% of that validation set was noise, measuring a scenario that does not exist in
-the real task.**
+**Result: 83% of validation set is noise, measuring scenarios that don't exist in the real task.**
 
-Two consequences, both bad:
+Consequences:
 
-1. **`eval_loss` loses its meaning** — whether the loss on a random-noise set is 3.9 or
-   4.3 has no stable relationship to "how well the model answers people".
-2. **The "v2 overfits" conclusion had the right direction and the wrong evidence.**
-   My reasoning rested on "val loss went up = overfitting", but if the validation set is
-   itself noise, you cannot separate how much of that rise is overfitting and how much
-   is noise.
+1. `eval_loss` loses meaning—noise set loss values have no stable relationship to "reply quality"
+2. "v2 overfits" conclusion has correct direction but wrong evidence—if validation set itself is noise, cannot separate overfitting from noise contributions in loss increases
 
-### The correct approach
+### Correct approach
 
-**The validation set must match the inference-time task.** This model's job is
-"a groupmate says something, how should I answer", so the validation set contains
-**reply samples only**:
+Validation set must match inference task. Model purpose is "member says something → reply", so validation set should **contain only reply samples**:
 
 ```python
-val_ds = reply_val                      # reply task only
-val_ds = rv.shuffle(seed=42)            # never take a sequential slice
+val_ds = reply_val
+val_ds = rv.shuffle(seed=42)
 ```
 
 Combined with:
 
-- **early stopping** on `eval_loss`, instead of blindly training a fixed step count;
-- **keeping every checkpoint** and selecting by validation loss, not taking the last step;
-- **`load_best_model_at_end=True`**.
+- **Early stopping** based on `eval_loss`, not fixed step counts
+- **Retain all checkpoints**, select by validation loss, not last step
+- **Enable `load_best_model_at_end=True`**
 
-> **Lesson**: a validation set is not "just a bit of held-out data".
-> **It is your definition of *good*.** Define a metric that doesn't match the real task,
-> and every judgement you make afterwards chases a phantom.
+**Key point**: Validation set defines the "good" standard. Metrics mismatched to real tasks cause all subsequent judgments to chase phantoms.
 
 ---
 
-## 7. Repository layout
+## Project structure
 
 ```
 .
-├── README.md              English (this file)
-├── README.zh-CN.md        Chinese
+├── README.md              English docs
+├── README.zh-CN.md        Chinese docs
 ├── requirements.txt
-├── .gitignore             <- the important one: keeps corpus and weights out
+├── .gitignore             Critical: hides corpus and weights
 ├── src/
-│   ├── config.py          identity/paths all from env vars (no hard-coded uin)
-│   ├── clean_corpus.py    corpus cleaning
-│   ├── build_sft_dataset.py  two-set construction (structurally separated)
-│   ├── check_masking.py   masking-contract verification
-│   ├── train_qlora.py     QLoRA training (early stop + task-matched val set)
-│   ├── merge_lora.py      shard-by-shard LoRA merge
-│   ├── export_gguf.sh     HF → GGUF → quantise → ollama create
-│   └── eval_adapters.py   one base load, many adapters A/B
+│   ├── config.py          Env vars for identity/paths (no hard-coding)
+│   ├── clean_corpus.py    Corpus cleaning
+│   ├── build_sft_dataset.py  Dataset construction
+│   ├── check_masking.py   Masking verification
+│   ├── train_qlora.py     QLoRA training
+│   ├── merge_lora.py      LoRA merging
+│   ├── export_gguf.sh     Format conversion
+│   └── eval_adapters.py   Multi-adapter comparison
 └── docs/
-    ├── pitfalls.md        pitfall details
+    ├── pitfalls.md        Detailed problems
     └── vram.md            VRAM diagnostics
 ```
 
 ---
 
-## 8. Reproducing this
+## Reproduction
 
 ### Environment
 
@@ -461,19 +355,19 @@ trl 0.15.2             accelerate 1.5.2       bitsandbytes 0.45.3
 datasets 3.5.0         numpy 2.2.6            sentencepiece 0.2.2
 ```
 
-### Identity comes from environment variables
+### Parameter configuration
 
-There is **no hard-coded uin or nickname anywhere in the code**:
+Code contains **no hard-coded uin or nicknames**, all from environment variables:
 
 ```bash
-export TARGET_UIN="<your uin>"
-export TARGET_NAME="<your group nickname>"
+export TARGET_UIN="<uin>"
+export TARGET_NAME="<group nickname>"
 export TARGET_GROUP="<group name>"
 export BASE_MODEL="D:/models/Qwen3-8B"
 export EXPORTS_DIR="C:/path/to/qq/exports"
 ```
 
-### Training
+### Training launch
 
 ```bash
 export HF_HOME="D:/models/hf_cache"
@@ -483,38 +377,31 @@ export EPOCHS=1 MAX_LEN=768 BATCH=1 GRAD_ACCUM=8
 python -u src/train_qlora.py
 ```
 
-### First, check whether your data is even enough
+### Data verification
+
+Must verify data quality before training:
 
 ```bash
-python src/check_masking.py      # verify the labels contract
+python src/check_masking.py
 ```
 
-**Run this before training.** It tells you whether the prompt is an exact prefix of the
-full sequence and how many tokens are actually supervised. This class of bug doesn't
-raise — it just quietly ruins your results.
+This script verifies whether prompt is exact prefix of full sequence and how many tokens are actually supervised. This class of bug produces no exceptions, only poor results.
 
 ---
 
-## 9. Why no corpus
+## Why no corpus
 
-This is not an oversight; it's a deliberate decision.
+### Privacy
 
-1. **The corpus is other people's private conversation.** Group members never agreed to
-   be published. Even though the export contained only my own messages, **the reply
-   quotes still contain other people's exact words and nicknames.**
-2. **Posting real dialogue as "style examples" means publishing someone's private life.**
-   Group chat contains education history, career plans, purchasing decisions, personal
-   relationships. Even redacted, the context itself leaks a great deal.
-3. **The fine-tuned weights are a lossy compression of the corpus.** So the weights
-   stay private too.
+1. **Others' messages**: Group members' messages lack publication consent. Even though export contains only self-messages, **reply quotes still contain others' original text and nicknames**
+2. **Life information leakage**: Group chat contains education, career plans, purchases, relationships. Publishing conversation samples leaks substantial information from context even when redacted
+3. **Weights are compression too**: Fine-tuned weights are lossy corpus compression, so weights also remain private
 
-**What is published is the method.** Those traps — VRAM paging, placeholder leakage,
-validation-set mismatch, discarded labels — have nothing to do with anyone's privacy,
-and are rarely explained properly in Chinese-language material. That is the part worth
-passing on.
+### Published content
 
-If you attempt something similar, copy the `.gitignore` and do it **before your first
-commit**.
+What's published is **method**. All problems—VRAM paging, placeholder leakage, validation set misalignment, label discarding—are privacy-agnostic and rarely discussed thoroughly in Chinese literature. This is the part worth preserving.
+
+If you need similar processing, copy `.gitignore` before first commit.
 
 ---
 
