@@ -12,6 +12,8 @@ Fine-tuned Qwen3-8B with QLoRA on a 12 GB VRAM laptop using single-user message 
 
 This repository contains **method, code, and complete analysis**. Raw corpus, trained weights, and real conversation examples are not published (see [Privacy](#why-no-corpus)).
 
+> **Status: shelved.** The training pipeline works. The reply task turned out to be underdetermined by its own data, which caps what any model can achieve on it regardless of recipe. The measurement that ended the project is in [Why this project was shelved](#why-this-project-was-shelved).
+
 ---
 
 ## Contents
@@ -22,6 +24,7 @@ This repository contains **method, code, and complete analysis**. Raw corpus, tr
 - [Processing pipeline](#processing-pipeline)
 - [Experimental results](#experimental-results)
 - [Validation set problem](#validation-set-problem)
+- [Why this project was shelved](#why-this-project-was-shelved)
 - [Project structure](#project-structure)
 - [Reproduction](#reproduction)
 - [Privacy](#privacy)
@@ -173,6 +176,54 @@ WS=/c/gguf
 
 **Note**: Solution depends on junction existing. Deleting junction causes all scripts to silently fail. Scripts should assert junction exists.
 
+### Problem 6: Multi-adapter evaluation silently measured the base model
+
+`eval_adapters.py` attached every adapter with
+
+```python
+model = PeftModel.from_pretrained(model, path, adapter_name=name)
+```
+
+inside a loop. On a model that is already a `PeftModel`, that call nests a `PeftModel` inside a `PeftModel`. The outer wrapper then expects keys carrying a doubled prefix (`base_model.model.base_model.model....lora_B.<name>.weight`), which matches nothing in the checkpoint, so **the weights are silently dropped**. `set_adapter()` still succeeds and the name still appears in `peft_config`, so nothing raises.
+
+Because LoRA initialises `lora_B` to zero, a dropped adapter is an exact no-op — it evaluates as the bare base model. Every column after the first in a multi-adapter sweep was therefore the base model wearing an adapter's name, and the symptom is indistinguishable from "this adapter changes nothing".
+
+Verified by comparing weight norms instead of trusting the warning text:
+
+| adapter | max abs `lora_B` in checkpoint | nested attach | `load_adapter()` |
+|---|---|---|---|
+| A | 0.2527 | 0.2527 | 0.2527 |
+| B | 0.3014 | **0** | 0.3014 |
+| C | 0.00735 | **0** | 0.00735 |
+
+**Fix**: only the first adapter may use `PeftModel.from_pretrained()`; every later one must use `model.load_adapter(path, adapter_name=name)`. `eval_adapters.py` now also calls a `verify_attached()` gate that compares each adapter's `lora_B` norm in the model against the checkpoint and **refuses to produce a table at all** when any adapter failed to load, rather than emitting a misleading comparison.
+
+Any multi-adapter result produced before this fix should be discarded. Single-adapter runs were unaffected, because the first attach is always correct.
+
+### Problem 7: The deployed GGUF was served without a chat template
+
+The fine-tuned models were published to Ollama with a Modelfile whose template was
+
+```
+TEMPLATE {{ .Prompt }}
+```
+
+This emits neither the `<|im_start|>`/`<|im_end|>` role markers nor `{{ .System }}`. The model therefore received a bare string with **no system prompt and no role structure at all**, while training had used the full Qwen3 chat template including the empty thinking block. Output quality under that configuration says nothing about the fine-tune.
+
+Two further traps in the same area:
+
+- Ollama's stock Qwen3 template appends ` /no_think` to the last user turn when `think=false`; `transformers`' `enable_thinking=False` does not. Serving through the stock template is close to the training shape but not identical.
+- With thinking left at its default (enabled), the thinking block consumed the entire response — the content field came back empty with the whole output in the reasoning field.
+
+**Fix**: render the prompt in the client and send it with `raw: true`, bypassing the Modelfile template. The renderer is three lines and was verified byte-for-byte **and token-id-for-token-id** against `apply_chat_template(..., enable_thinking=False)` on both task shapes:
+
+```python
+def render_prompt(messages):
+    out = [f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages]
+    out.append('<|im_start|>assistant\n<think>\n\n</think>\n\n')
+    return ''.join(out)
+```
+
 ### Ollama 0.40.2 deployment routes blocked
 
 | Attempt | Result |
@@ -321,6 +372,57 @@ Combined with:
 
 ---
 
+## Why this project was shelved
+
+The pipeline works. The task does not. This section is the measurement that closed the project.
+
+### The reply task is underdetermined by its own data
+
+A chat log records what was said, never what it was about. To test whether the reply task is answerable at all, the built dataset was measured against itself rather than against any model. The reply split (n=1770):
+
+| Measurement | Value |
+|---|---|
+| Distinct stimuli | 1650 |
+| Stimuli occurring more than once | 57 (covering 177 rows, 10.0%) |
+| ...of those, **every repetition received a different real answer** | **98.2%** |
+| Stimuli containing a referring expression with no referent in the input | 28.6% |
+| Stimuli of 4 characters or fewer | 13.3% |
+| Either of the above | 41.0% |
+
+The third row is decisive. Where the same words recurred in the log they were almost never answered the same way twice. The extreme case is one stimulus appearing 14 times with **14 distinct answers**; other recurring stimuli yield 12–13 distinct answers each. On those rows the achievable top-1 accuracy is capped near 1/k by the data, before any model is involved. The mildest illustration sits in the held-out split: a plain yes/no question appears twice and was answered **in opposite directions** on the two occasions.
+
+This also breaks the evaluation. The "real answer" used as ground truth in the comparison tables is one of several equally real answers to the same input, so part of what `overlap0` and the similarity numbers measure is the arbitrariness of that choice rather than model quality.
+
+### The design decision made it worse
+
+`build_sft_dataset.py` deliberately keeps the persona's own history out of the user turn, because including it is what taught the model to invent prior conversation (see [Problem 2](#problem-2-task-confusion)). That change removed the hallucination — and removed, in the same stroke, the information needed to answer. For a stimulus that is a fragment or a bare referring expression, the single-line prompt does not contain what is being referred to.
+
+The observed failure mode is exactly what this predicts: **correct length and correct register, unmoored content.** Length transfer clearly succeeded — training targets have median 5 characters and 58.6% are ≤6 characters, and the best adapter reproduces median 5 with 100% ≤6. The model learned *how* this person talks and cannot learn *what* they were talking about.
+
+More steps cannot fix this. No learning rate, epoch count, or dataset size recovers information that was never in the input.
+
+### What would have to change
+
+The task formulation, not the training. Anything that makes the reply answerable has to supply the real preceding conversation as context at both training and inference time — which is the very thing that originally produced fabricated prior conversation, and which therefore needs a different dataset design (always-present real context, never a synthesised one). That is a different project.
+
+### Caveat on one of these numbers
+
+The `continue` task reports a constant one-line cue in 100% of rows, which looks like a worse version of the same problem. It is not: for `continue` the conditioning information lives in the preceding turns, and the measurement above only inspected the final cue line. That statistic is an artifact of the metric and carries no signal about the continue task. It is recorded here so the number is not reused incorrectly.
+
+### Outcome
+
+- **Training**: fine. Loss converged, the length distribution and colloquial register transferred, and the masking contract held on every split.
+- **Serving**: two independent silent bugs were found late (Problems 6 and 7), so part of the negative impression of these models was formed on mis-served weights rather than on the weights themselves.
+- **Ceiling**: the reply task is underdetermined for a large share of its rows. The ceiling is in the data, not in the recipe.
+
+### Files changed in this pass
+
+- `src/eval_adapters.py` — multi-adapter attach fixed (`load_adapter` for every adapter after the first) plus the `verify_attached()` gate that fails loudly instead of emitting a table built on dropped weights. This is the only change to published code, and it matters independently of whether the project continues.
+
+The scripts used to measure the tables above are not published; they read the corpus directly. The three numbers the conclusion rests on — distinct stimuli, repeat count with divergent answers, and referring-expression rate — are recomputable from any export with a few lines of code.
+
+---
+
 ## Project structure
 
 ```
@@ -337,7 +439,7 @@ Combined with:
 │   ├── train_qlora.py     QLoRA training
 │   ├── merge_lora.py      LoRA merging
 │   ├── export_gguf.sh     Format conversion
-│   └── eval_adapters.py   Multi-adapter comparison
+│   └── eval_adapters.py   Multi-adapter comparison (see Problem 6)
 └── docs/
     ├── pitfalls.md        Detailed problems
     └── vram.md            VRAM diagnostics

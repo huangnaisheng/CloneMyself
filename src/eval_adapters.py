@@ -62,6 +62,41 @@ def build_messages(stim, style):
             {'role': 'user', 'content': stim}]
 
 
+def verify_attached(model, name_to_path):
+    """Fail loudly if an adapter silently evaluated as the base model.
+
+    An adapter whose weights failed to load keeps lora_B at its zero
+    initialisation, which makes it a mathematical no-op -- identical in effect
+    to the bare base model.  set_adapter() still succeeds and the name still
+    appears in peft_config, so the only reliable check is the numbers: compare
+    the norm found in the model against the norm stored in the checkpoint.
+    """
+    from safetensors.torch import load_file
+    bad = []
+    for name, path in name_to_path.items():
+        try:
+            ck = load_file(os.path.join(path, 'adapter_model.safetensors'))
+            want = max((float(v.abs().max()) for k, v in ck.items()
+                        if 'lora_B' in k), default=0.0)
+        except Exception as e:
+            print(f'  ?? cannot read {name} checkpoint, skipping check ({e})')
+            continue
+        sufs = (f'lora_B.{name}.weight', f'lora_B.{name}')
+        got = [v.detach().abs().max().item()
+               for k, v in model.named_parameters() if k.endswith(sufs)]
+        have = max(got) if got else 0.0
+        good = have > 0 and abs(have - want) <= 1e-3 * max(1.0, want)
+        print(f'  verify {name:6s} lora_B in model={have:<12.6g} '
+              f'checkpoint={want:<12.6g} {"ok" if good else "DROPPED"}')
+        if not good:
+            bad.append(name)
+    if bad:
+        raise SystemExit(
+            'adapter(s) ' + ', '.join(bad) + ' did not load; their columns '
+            'would silently be the bare base model.  Refusing to produce a '
+            'misleading comparison.')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--val', default=os.path.join(
@@ -103,13 +138,27 @@ def main():
         C.BASE_MODEL, quantization_config=bnb, device_map={'': 0},
         trust_remote_code=True, attn_implementation='sdpa')
 
+    # Only the FIRST adapter may be attached with PeftModel.from_pretrained().
+    # Calling it again on a model that is already a PeftModel nests a PeftModel
+    # inside a PeftModel; the outer wrapper then expects doubled key prefixes
+    # (base_model.model.base_model.model....lora_B.<name>.weight), nothing
+    # matches the checkpoint, and the weights are dropped.  Because LoRA
+    # initialises lora_B to zero, a dropped adapter is a no-op that evaluates as
+    # the bare base model -- so the sweep would report "this adapter changes
+    # nothing" instead of "this adapter failed to load".  Every later adapter
+    # must go through load_adapter().  verify_attached() below fails loudly if
+    # this ever regresses again.
     names = []
     for name, path in models.items():
         if path:
-            model = PeftModel.from_pretrained(model, path, adapter_name=name)
+            if not names:
+                model = PeftModel.from_pretrained(model, path, adapter_name=name)
+            else:
+                model.load_adapter(path, adapter_name=name, is_trainable=False)
             names.append(name)
             print('  attached adapter', name, '<-', path)
     model.eval()
+    verify_attached(model, {n: p for n, p in models.items() if p})
 
     def generate(messages):
         ids = tok.apply_chat_template(messages, add_generation_prompt=True,
